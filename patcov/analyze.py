@@ -85,21 +85,41 @@ def _check_budget(budget) -> int:
     return budget
 
 
-def analyze(types, patterns, *, budget: int = DEFAULT_BUDGET) -> AnalysisResult:
+def analyze(types, patterns, *, budget: int = DEFAULT_BUDGET,
+            version: int = 1, certificate=None):
     """代数数据类型模式的覆盖见证分析。
 
     :param types: 有序 dict，首项为被测根类型；形态见模块文档与 README。
-    :param patterns: 分支模式列表（源顺序即匹配优先级顺序）；允许空列表，
-        此时所有值均未覆盖。
-    :param budget: 搜索工作量上限（正整数）。耗尽时抛
-        :class:`CoverageBudgetExhausted`——它表示“预算内未能得出结论”，
-        **不是**“已证明穷举”。
-    :returns: :class:`AnalysisResult`
+    :param patterns: 分支模式列表（源顺序即匹配优先级顺序）；允许空列表。
+    :param budget: 搜索工作量上限（正整数）。
+    :param version:
+        - ``1``（默认）：有限非递归类型；预算耗尽抛
+          :class:`CoverageBudgetExhausted`，返回 :class:`AnalysisResult`。
+        - ``2``：递归/互递归类型 + 整数闭区间类型 + or 绑定 + 分支守卫；
+          返回 :class:`patcov.v2.V2Result`。预算耗尽**不抛异常**，而是给
+          ``status="unknown"`` 与未决状态（题面要求：不能宣称穷尽）。
+    :param certificate:
+        - v1：只允许默认/False；True 报 CoverageError。
+        - v2：默认 None 表示**成功时提交覆盖证书**（有限状态闭合关系，
+          题面要求）；显式 ``certificate=False`` 可关闭以节省内存。
     :raises CoverageError: 输入违反契约（错误信息含可定位路径）
-    :raises CoverageBudgetExhausted: 搜索预算耗尽
+    :raises CoverageBudgetExhausted: （仅 v1）搜索预算耗尽
     """
     budget = _check_budget(budget)
-    table: TypeTable = build_type_table(types)
+    if version == 1:
+        if certificate:
+            raise CoverageError("certificate=True 仅在 version=2 下可用")
+        return _analyze_v1(types, patterns, budget)
+    if version == 2:
+        from .v2 import analyze_v2
+        want = True if certificate is None else bool(certificate)
+        return analyze_v2(types, patterns, budget=budget,
+                          want_certificate=want)
+    raise CoverageError(f"version: 仅支持 1 或 2，得到 {version!r}")
+
+
+def _analyze_v1(types, patterns, budget: int) -> AnalysisResult:
+    table: TypeTable = build_type_table(types, version=1)
 
     if not isinstance(patterns, (list, tuple)):
         raise CoverageError(
