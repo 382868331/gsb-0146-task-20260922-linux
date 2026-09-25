@@ -16,7 +16,8 @@ from .model import (
     MAX_NESTING,
     TypeTable,
     build_type_table,
-    normalize,
+    normalize_patterns,
+    strip_bindings,
     table_by_id,
 )
 from .solver import BOT_ID, DecisionSolver
@@ -101,13 +102,9 @@ def analyze(types, patterns, *, budget: int = DEFAULT_BUDGET) -> AnalysisResult:
     budget = _check_budget(budget)
     table: TypeTable = build_type_table(types)
 
-    if not isinstance(patterns, (list, tuple)):
-        raise CoverageError(
-            f"patterns: 必须是 list/tuple（分支的源顺序列表），得到 {type(patterns).__name__}"
-        )
-    norm = []
-    for i, pat in enumerate(patterns):
-        norm.append(normalize(table, pat, table.root, f"patterns[{i}]"))
+    # 绑定（var/as）只影响匹配执行的绑定产出；覆盖分析一律视为通配，
+    # 故规范化后先 strip 成纯模式（W/C/T/O），纯模式结果与无绑定时完全一致。
+    norm = [strip_bindings(node) for node in normalize_patterns(table, patterns)]
 
     by_id = table_by_id(table)
     solver = DecisionSolver(table, by_id, budget)

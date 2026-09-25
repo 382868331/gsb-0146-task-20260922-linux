@@ -13,6 +13,7 @@ from patcov import (
     CoverageBudgetExhausted,
     CoverageError,
     analyze,
+    compile_matcher,
 )
 
 
@@ -67,6 +68,54 @@ def main() -> None:
         print("整体：已穷举，无遗漏值。")
     else:
         print(f"整体：字典序最小遗漏值 = {render(result.uncovered)}")
+
+    # ------------------------------------------------- 编译/执行：命中分支与绑定
+    section("编译/执行入口：compile_matcher + match，返回首个命中分支与绑定字典")
+    matcher = compile_matcher(
+        types,
+        [
+            ("Circle", "True"),                       # 0：纯模式，无绑定
+            ("as", "rect", ("Rect", ("var", "w"), "_")),  # 1：as 捕获整个子树
+            # 2：or 的两个备选绑定相同的名字与类型（c: Shape）
+            ("or", ("as", "c", "Dot"), ("as", "c", ("Circle", "_"))),
+        ],
+    )
+    for value in [("Circle", True), ("Rect", False, True), ("Circle", False), "Dot"]:
+        hit = matcher.match(value)
+        print(f"  match({render(value)}) -> 分支 {hit.branch}，绑定 "
+              + "{" + ", ".join(f"{k} = {render(v)}" for k, v in hit.bindings.items()) + "}")
+    # 无命中：显式返回 None（matcher2 只覆盖 (Circle, True)）
+    matcher2 = compile_matcher(types, [("Circle", "True")])
+    miss = matcher2.match("Dot")
+    print(f"  无命中时显式返回：match(Dot) -> {miss!r}")
+
+    # --------------------------------------- 覆盖完整却有冗余分支（含绑定模式）
+    section("覆盖分析视绑定为通配：覆盖完整却有冗余分支")
+    opt_types = {"Opt": {"kind": "sum", "variants": [
+        ("None", []), ("Some", [("v", "Bool")])]}}
+    opt_pats = [
+        "None",
+        ("Some", ("var", "v")),               # var 在覆盖分析中等价于通配
+        ("or", "None", ("Some", "True")),     # 已被前两条完全覆盖 → 冗余
+    ]
+    opt = analyze(opt_types, opt_pats)
+    print(f"  exhaustive={opt.exhaustive}，uncovered={opt.uncovered}，"
+          f"冗余分支={list(opt.redundant_branches)}")
+    pure = analyze(opt_types, ["None", ("Some", "_"), ("or", "None", ("Some", "True"))])
+    same = ([(b.useful, b.witness) for b in opt.branches]
+            == [(b.useful, b.witness) for b in pure.branches]
+            and opt.uncovered == pure.uncovered)
+    print(f"  与纯模式（var→_）逐分支结果一致：{same}")
+
+    # ------------------------------------------ 边界 3：错误类型的值被明确拒绝
+    section("拒绝边界：错误类型的输入值（可定位，不静默纠正）")
+    for bad in [("Circle", "not-a-bool"), ("Nope", True), 42]:
+        try:
+            matcher.match(bad)
+        except CoverageError as exc:
+            print(f"  match({bad!r}) 被拒绝：{exc}")
+        else:
+            raise AssertionError("错误类型的值必须被拒绝")
 
     # ------------------------------------------------------- 巨大 Bool 积
     section("巨大 Bool 积：500 个 Bool 字段（值域 2^500，绝不展开笛卡尔积）")

@@ -151,6 +151,96 @@ def matches(ref: RefTypeTable, tname: str, pat, value) -> bool:
     return ref.matches(tname, pat, value)
 
 
+# ----------------------------------------------------------- 绑定匹配（独立实现）
+
+def match_bindings(ref: RefTypeTable, tname: str, pat, value):
+    """直接递归匹配公开模式（含 var/as 绑定）。
+
+    命中返回绑定 dict（可能为空），未命中返回 None。独立代码路径：
+    直接解析公开模式形态，不经过 patcov 的任何内部表示。
+    """
+    if pat == "_":
+        return {}
+    t = ref.types[tname]
+    kind = t["kind"]
+
+    if isinstance(pat, list):
+        if kind != "product" or not isinstance(value, tuple):
+            return None
+        if len(pat) != len(value):
+            return None
+        out = {}
+        for (_, ft), p, v in zip(t["fields"], pat, value):
+            sub = match_bindings(ref, ft, p, v)
+            if sub is None:
+                return None
+            out.update(sub)
+        return out
+
+    if isinstance(pat, str):
+        if kind == "bool":
+            return {} if value is (pat == "True") else None
+        return {} if value == pat else None
+
+    # tuple
+    tag = pat[0]
+    if tag == "var":
+        return {pat[1]: value}
+    if tag == "as":
+        sub = match_bindings(ref, tname, pat[2], value)
+        if sub is None:
+            return None
+        sub = dict(sub)
+        sub[pat[1]] = value
+        return sub
+    if tag == "or":
+        for alt in pat[1:]:
+            sub = match_bindings(ref, tname, alt, value)
+            if sub is not None:
+                return sub
+        return None
+    # 构造器模式
+    if kind != "sum" or not isinstance(value, tuple):
+        return None
+    if value[0] != tag:
+        return None
+    fields = dict(t["variants"])[tag]
+    args = pat[1:]
+    if len(args) != len(fields):
+        return None
+    out = {}
+    for (_, ft), p, v in zip(fields, args, value[1:]):
+        sub = match_bindings(ref, ft, p, v)
+        if sub is None:
+            return None
+        out.update(sub)
+    return out
+
+
+def first_hit(ref: RefTypeTable, root: str, patterns, value):
+    """按源顺序逐分支尝试；返回 (分支下标, 绑定 dict) 或 None。"""
+    for i, pat in enumerate(patterns):
+        b = match_bindings(ref, root, pat, value)
+        if b is not None:
+            return (i, b)
+    return None
+
+
+def strip_public(pat):
+    """独立地把公开模式中的绑定去掉：var→"_"，as→其子模式（供对照 analyze）。"""
+    if isinstance(pat, list):
+        return [strip_public(p) for p in pat]
+    if isinstance(pat, tuple) and pat and isinstance(pat[0], str):
+        if pat[0] == "var":
+            return "_"
+        if pat[0] == "as":
+            return strip_public(pat[2])
+        if pat[0] == "or":
+            return ("or", *[strip_public(a) for a in pat[1:]])
+        return (pat[0], *[strip_public(a) for a in pat[1:]])
+    return pat
+
+
 def brute_force_expected(ref: RefTypeTable, root: str, patterns) -> dict:
     """逐分支暴力计算期望值。返回 {uncovered, branches:[{useful,witness}]}。"""
     universe = set(ref.all_values(root))
