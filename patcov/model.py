@@ -16,6 +16,15 @@
 - ``("C", p1, ..., pn)``  构造器模式
 - ``[p1, ..., pn]``       积（元组）模式
 - ``("or", p1, ..., pn)`` 或模式（允许重复备选，语义为集合求并）
+- ``("var", "x")``        变量绑定：匹配任意值，并把该完整子树绑给 x
+- ``("as", p, "x")``      as 绑定：p 匹配时，把 p 所在位置的完整子树绑给 x
+
+绑定规则（规范化阶段强制）：
+- 绑定名必须是非空字符串且不为 ``"_"``；``"var"``/``"as"``/``"or"`` 为语法保留字，
+  不得用作构造器名。
+- 同一条路径（or 各备选视为不同路径）上绑定名不得重复。
+- 同一 or 的各备选必须绑定*完全相同*的名字集合，且每个名字在各备选中标注的
+  类型相同；否则在分析/编译阶段拒绝。
 
 见证值（分析输出）：
 
@@ -43,7 +52,9 @@ MAX_PATTERN_NODES = 1_000_000
 BOOL_NAME = "Bool"
 WILD = "_"
 OR_TAG = "or"
-RESERVED_LABELS = (WILD, OR_TAG)
+VAR_TAG = "var"
+AS_TAG = "as"
+RESERVED_LABELS = (WILD, OR_TAG, VAR_TAG, AS_TAG)
 
 
 # ---------------------------------------------------------------- 模式内部表示
@@ -52,6 +63,8 @@ RESERVED_LABELS = (WILD, OR_TAG)
 # ('C', ctor_gid, args)          构造器，ctor_gid = (类型名, 输入次序编号)
 # ('T', args)                    积
 # ('O', alts)                    或
+# ('B', name)                    变量绑定（var），匹配处类型由上下文确定
+# ('A', name, inner)             as 绑定，捕获 inner 所在位置的完整子树
 # args/alts 均为节点 tuple
 
 _WILD_NODE = ("W",)
@@ -71,6 +84,14 @@ def P_tuple(args: tuple) -> tuple:
 
 def P_or(alts: tuple) -> tuple:
     return ("O", alts)
+
+
+def P_bind(name: str) -> tuple:
+    return ("B", name)
+
+
+def P_as(name: str, inner: tuple) -> tuple:
+    return ("A", name, inner)
 
 
 # ---------------------------------------------------------------- 类型表
@@ -325,23 +346,39 @@ def build_type_table(types) -> TypeTable:
 
 # ---------------------------------------------------------------- 模式规范化
 
-def normalize(table: TypeTable, pat, tid: int, path: str) -> tuple:
-    """把公开模式形态校验并转为内部节点；path 用于错误定位（如 patterns[3]）。"""
+def _check_bind_name(path, name) -> str:
+    if not isinstance(name, str) or not name:
+        raise _err(path, f"绑定名必须是非空字符串，得到 {type(name).__name__!s}")
+    if name == WILD:
+        raise _err(path, "绑定名不能是 '_'（通配不产生绑定）")
+    return name
+
+
+def normalize(table: TypeTable, pat, tid: int, path: str):
+    """把公开模式形态校验并转为内部节点；path 用于错误定位（如 patterns[3]）。
+
+    :returns: ``(node, bindings)``；``bindings`` 为 ``{绑定名: 类型id}``。
+      对于含 or 的模式，bindings 是各备选绑定求交后的结果——规范化已保证各
+      备选绑定名字集合与类型完全一致，故交集即每个备选的绑定表。
+      绑定不影响匹配集（当作通配），但执行时据此填充绑定字典。
+    """
     by_id = table_by_id(table)
     counter = [0]
 
-    def go(p, t: int, pth: str) -> tuple:
+    def go(p, t: int, pth: str, seen: dict) -> tuple:
+        """seen: 当前路径上已出现的绑定名 -> 类型id（同路径重名在此拒绝）。
+        返回 (内部节点, 该子树绑定表 {名字: 类型id})。"""
         counter[0] += 1
         if counter[0] > MAX_PATTERN_NODES:
             raise _err(path, f"模式节点数超过上限 {MAX_PATTERN_NODES}（路径 {pth}）")
         decl = by_id[t]
 
         if p == WILD:
-            return P_wild()
+            return P_wild(), {}
         if isinstance(p, bool) or not isinstance(p, (str, list, tuple)):
             raise _err(
                 pth,
-                "模式必须是 '_'(通配)、str(零元构造器)、list(积模式) 或 tuple(构造器/or 模式)，"
+                "模式必须是 '_'(通配)、str(零元构造器)、list(积模式) 或 tuple(构造器/or/var/as 模式)，"
                 f"得到 {type(p).__name__}",
             )
         if isinstance(p, list):
@@ -350,22 +387,52 @@ def normalize(table: TypeTable, pat, tid: int, path: str) -> tuple:
             fields = decl.ctors[0].fields
             if len(p) != len(fields):
                 raise _err(pth, f"积模式字段数 {len(p)} 与类型 {decl.name!r} 的 {len(fields)} 个字段不符")
-            return P_tuple(tuple(go(x, fields[j][1], f"{pth}[{j}]") for j, x in enumerate(p)))
+            args, sub = _go_seq(p, fields, pth, go, seen)
+            return P_tuple(args), sub
         if isinstance(p, str):
-            return make_con(p, (), decl, pth, go)
+            return make_con(p, (), decl, pth, go, seen)
 
         if not p:
             raise _err(pth, "空 tuple 不是合法模式（构造器模式至少含标签，or 至少含一个备选）")
         tag = p[0]
         if not isinstance(tag, str):
-            raise _err(pth + "[0]", f"tuple 模式首元素必须是构造器标签或 'or'，得到 {type(tag).__name__}")
+            raise _err(pth + "[0]", f"tuple 模式首元素必须是构造器标签或 'or'/'var'/'as'，得到 {type(tag).__name__}")
         if tag == OR_TAG:
             if len(p) < 2:
                 raise _err(pth, "or 模式至少需要一个备选")
-            return P_or(tuple(go(x, t, f"{pth}[{j + 1}]") for j, x in enumerate(p[1:])))
-        return make_con(tag, p[1:], decl, pth, go)
+            alt_nodes = []
+            alt_binds = []
+            for j, x in enumerate(p[1:]):
+                # 各备选是互相独立的路径：同名在不同备选中不算重复，
+                # 但同一备选内部仍受“同一路径不重名”约束。
+                node_a, binds_a = go(x, t, f"{pth}[{j + 1}]", dict(seen))
+                alt_nodes.append(node_a)
+                alt_binds.append(binds_a)
+            common = _check_or_binds(alt_binds, t, by_id, pth)
+            # or 在每条经过此处的路径上都绑定 common 中的名字（各备选一致），
+            # 故对后续兄弟位置可见——写回共享 seen 以捕获跨位置重名。
+            seen.update(common)
+            return P_or(tuple(alt_nodes)), common
+        if tag == VAR_TAG:
+            if len(p) != 2:
+                raise _err(pth, f"变量绑定形态为 ('var', 名字)，得到 {len(p) - 1} 个元素")
+            name = _check_bind_name(f"{pth}[1]", p[1])
+            _declare_bind(name, t, seen, f"{pth}[1]")
+            return P_bind(name), {name: t}
+        if tag == AS_TAG:
+            if len(p) != 3:
+                raise _err(pth, f"as 绑定形态为 ('as', 子模式, 名字)，得到 {len(p) - 1} 个元素")
+            name = _check_bind_name(f"{pth}[2]", p[2])
+            _declare_bind(name, t, seen, f"{pth}[2]")
+            # 直接共享 seen：内层新绑定沿该路径继续对后续兄弟位置可见；
+            # 内层若含 or，or 自己用副本做备选作用域，不会污染备选间判定。
+            inner, sub = go(p[1], t, f"{pth}[1]", seen)
+            binds = dict(sub)
+            binds[name] = t
+            return P_as(name, inner), binds
+        return make_con(tag, p[1:], decl, pth, go, seen)
 
-    def make_con(tag: str, raw_args, decl: TDecl, pth: str, go) -> tuple:
+    def make_con(tag: str, raw_args, decl: TDecl, pth: str, go, seen: dict) -> tuple:
         if decl.kind == "product":
             raise _err(pth, f"类型 {decl.name!r} 是 product，此处必须用积模式 [...]，不能用构造器 {tag!r}")
         idx = next((j for j, c in enumerate(decl.ctors) if c.name == tag), None)
@@ -375,12 +442,62 @@ def normalize(table: TypeTable, pat, tid: int, path: str) -> tuple:
         ctor = decl.ctors[idx]
         if len(raw_args) != len(ctor.fields):
             raise _err(pth, f"构造器 {tag!r} 需要 {len(ctor.fields)} 个字段模式，得到 {len(raw_args)} 个")
-        args = tuple(go(x, ctor.fields[j][1], f"{pth}[{j + 1}]") for j, x in enumerate(raw_args))
-        return P_con((decl.name, idx), args)
+        args, sub = _go_seq(raw_args, ctor.fields, pth, go, seen, idx0=1)
+        return P_con((decl.name, idx), args), sub
 
-    root_node = go(pat, tid, path)
+    def _declare_bind(name: str, t: int, seen: dict, pth: str) -> None:
+        if name in seen:
+            decl = by_id[t]
+            other = by_id[seen[name]]
+            raise _err(
+                pth,
+                f"绑定名 {name!r} 在同一条路径上重复（另一处类型为 {other.name!r}，"
+                f"本处类型为 {decl.name!r}）；or 的不同备选不算同一路径",
+            )
+        seen[name] = t
+
+    root_node, root_binds = go(pat, tid, path, {})
     _check_depth(root_node, by_id, tid, path)
-    return root_node
+    return root_node, root_binds
+
+
+def _go_seq(raw, fields, pth, go, seen, idx0: int = 0):
+    """依次规范化构造器/积的字段子模式；绑定表按字段次序合并，同路径重名由 go 拒绝。"""
+    args = []
+    merged = {}
+    for j, x in enumerate(raw):
+        node_a, binds_a = go(x, fields[j][1], f"{pth}[{j + idx0}]", seen)
+        args.append(node_a)
+        merged.update(binds_a)
+    return tuple(args), merged
+
+
+def _check_or_binds(alt_binds: list, t: int, by_id: dict, pth: str) -> dict:
+    """or 各备选必须绑定完全相同的名字集合与类型，否则拒绝。
+
+    外层已出现的绑定（seen）已在各备选的 seen 中；这里只核对各备选*自身新增*
+    绑定表（alt_binds 不含 seen，因 go 子树只返回子树内绑定）。
+    """
+    first = alt_binds[0]
+    names0 = set(first)
+    for j, binds in enumerate(alt_binds[1:], start=1):
+        names_j = set(binds)
+        missing = names0 - names_j
+        extra = names_j - names0
+        problems = []
+        if missing:
+            problems.append(f"备选 {j + 1} 缺少绑定 {sorted(missing)}")
+        if extra:
+            problems.append(f"备选 {j + 1} 多出绑定 {sorted(extra)}")
+        for name in names0 & names_j:
+            if binds[name] != first[name]:
+                problems.append(
+                    f"绑定 {name!r} 类型不一致：备选 1 为 {by_id[first[name]].name!r}，"
+                    f"备选 {j + 1} 为 {by_id[binds[name]].name!r}"
+                )
+        if problems:
+            raise _err(pth, "or 的各备选必须绑定完全相同的名字与类型；" + "；".join(problems))
+    return dict(first)
 
 
 def _check_depth(node, by_id, tid, path):
@@ -390,6 +507,12 @@ def _check_depth(node, by_id, tid, path):
         decl = by_id[t]
         if tag == "W":
             return 1
+        if tag == "B":
+            return 1
+        if tag == "A":
+            # as 是模式语法层（与 or 同口径计入“模式嵌套深度”），不引入类型层级，
+            # 但仍受 12 层的工程栈边界约束。
+            return 1 + depth(n[2], t)
         if tag == "O":
             return 1 + max(depth(a, t) for a in n[1])
         if tag == "T":
@@ -461,3 +584,63 @@ def min_value(by_id: dict, tid: int):
     if not fvs:
         return ctor.name
     return (ctor.name, *fvs)
+
+
+# ---------------------------------------------------------------- 输入值校验
+
+def validate_value(by_id: dict, tid: int, value, path: str = "value"):
+    """校验外部输入的待匹配值是否为 tid 类型的合法值；非法时抛带路径的 CoverageError。
+
+    合法形态与见证值一致：Bool=Python bool；枚举/零元变体=标签字符串；
+    积=tuple；带字段变体=(标签, 字段值...)。
+    """
+    decl = by_id[tid]
+    kind = decl.kind
+
+    if kind == "bool":
+        # 必须严格是 bool，拒绝 int 等（bool 是 int 子类，需显式判别）
+        if not isinstance(value, bool):
+            raise _err(path, f"类型 {BOOL_NAME} 的值必须是 bool（True/False），"
+                             f"得到 {type(value).__name__}：{value!r}")
+        return
+
+    if kind == "product":
+        fields = decl.ctors[0].fields
+        if not isinstance(value, tuple):
+            raise _err(path, f"类型 {decl.name!r}（product）的值必须是 tuple，"
+                             f"得到 {type(value).__name__}：{value!r}")
+        if len(value) != len(fields):
+            raise _err(path, f"类型 {decl.name!r} 的积值应有 {len(fields)} 个字段，"
+                             f"得到 {len(value)} 个：{value!r}")
+        for j, ((_, ft), v) in enumerate(zip(fields, value)):
+            validate_value(by_id, ft, v, f"{path}[{j}]")
+        return
+
+    # enum / sum：零元为标签字符串；带字段变体为 (标签, ...)
+    if isinstance(value, str):
+        idx = next((j for j, c in enumerate(decl.ctors) if c.name == value), None)
+        if idx is None:
+            raise _err(path, f"标签 {value!r} 不属于类型 {decl.name!r}；"
+                             f"合法构造器（按输入次序）：{[c.name for c in decl.ctors]}")
+        if decl.ctors[idx].fields:
+            raise _err(path, f"构造器 {value!r} 带 {len(decl.ctors[idx].fields)} 个字段，"
+                             f"其值必须是 ({value!r}, 字段值...) 元组，不能只有标签字符串")
+        return
+
+    if not isinstance(value, tuple) or not value or not isinstance(value[0], str):
+        raise _err(path, f"类型 {decl.name!r}（{kind}）的值必须是构造器标签字符串或"
+                         f" (标签, 字段值...) 元组，得到 {type(value).__name__}：{value!r}")
+    label = value[0]
+    idx = next((j for j, c in enumerate(decl.ctors) if c.name == label), None)
+    if idx is None:
+        raise _err(path + f"[0]", f"构造器 {label!r} 不属于类型 {decl.name!r}；"
+                                  f"合法构造器（按输入次序）：{[c.name for c in decl.ctors]}")
+    ctor = decl.ctors[idx]
+    if not ctor.fields:
+        raise _err(path, f"构造器 {label!r} 是零元的，其值应为标签字符串 {label!r}，"
+                         f"不应带字段（得到 {value!r}）")
+    if len(value) != 1 + len(ctor.fields):
+        raise _err(path, f"构造器 {label!r} 需要 {len(ctor.fields)} 个字段值，"
+                         f"得到 {len(value) - 1} 个：{value!r}")
+    for j, ((_, ft), v) in enumerate(zip(ctor.fields, value[1:])):
+        validate_value(by_id, ft, v, f"{path}[{j + 1}]")

@@ -13,6 +13,7 @@ from patcov import (
     CoverageBudgetExhausted,
     CoverageError,
     analyze,
+    compile_patterns,
 )
 
 
@@ -67,6 +68,74 @@ def main() -> None:
         print("整体：已穷举，无遗漏值。")
     else:
         print(f"整体：字典序最小遗漏值 = {render(result.uncovered)}")
+
+    # ----------------------------------------------- 变量绑定 / as / 编译执行
+    section("变量绑定与 as：编译后对具体值执行，返回首个命中分支与绑定字典")
+    # 两层非递归：Expr(根) 的字段是 Inner；含嵌套积与有标签和
+    expr_types = {
+        "Expr": {"kind": "sum", "variants": [
+            ("Not", [("e", "Inner")]),
+            ("Pair", [("a", "Inner"), ("b", "Inner")]),
+        ]},
+        "Inner": {"kind": "sum", "variants": [
+            ("Lit", [("v", "Bool")]),
+            ("Empty", []),
+        ]},
+    }
+    expr_patterns = [
+        ("Not", ("var", "e")),                              # 0：绑定整个 Inner 子树
+        ("as", ("Pair", ("Lit", ("var", "b")), "_"), "p"),  # 1：as 捕获整个 Pair
+        ("Pair", "Empty", "Empty"),                         # 2：无绑定
+    ]
+    cp = compile_patterns(expr_types, expr_patterns)
+    ar = cp.analyze()
+    print("  各分支绑定（名字:类型）：")
+    for b in ar.branches:
+        print(f"    分支 {b.index}: {b.bindings}")
+    for val in [("Not", ("Lit", True)),
+                ("Pair", ("Lit", True), "Empty"),
+                ("Pair", "Empty", "Empty"),
+                ("Pair", "Empty", ("Lit", False)),  # 三支均不匹配：实际无命中
+                ("Not", "Empty")]:
+        m = cp.run(val)
+        if m is None:
+            print(f"  {render(val)} -> 无命中（显式 None）")
+        else:
+            print(f"  {render(val)} -> 分支 {m.branch}，绑定 = "
+                  + "{ " + ", ".join(f"{k}: {render(v)}" for k, v in m.bindings.items()) + " }")
+
+    # 覆盖完整却含冗余分支的例子
+    print()
+    print("  覆盖完整却冗余：enum 上 as 捕获 + 通配已穷举，最后的字面量分支永不命中")
+    color_types = {"Color": {"kind": "enum", "constructors": ["Red", "Green", "Blue"]}}
+    color_pats = [("as", "Red", "c"), "_", "Green"]
+    cr = analyze(color_types, color_pats)
+    print(f"    exhaustive={cr.exhaustive}，冗余分支下标={list(cr.redundant_branches)}")
+    ccp = compile_patterns(color_types, color_pats)
+    print(f"    值 'Green' 实际命中分支 {ccp.run('Green').branch}"
+          f"（通配分支 1，而非冗余分支 2）；值 'Red' 绑定={ccp.run('Red').bindings}")
+
+    # 绑定规则边界：or 各备选绑定名字必须完全一致（分析/编译阶段拒绝）
+    print()
+    print("  绑定规则边界：or 的两个备选绑定名字不一致，在分析阶段即拒绝")
+    bad_or = [("or", ("Not", ("var", "x")),
+               ("Pair", ("Lit", ("var", "b")), "_"))]
+    try:
+        compile_patterns(expr_types, bad_or)
+    except CoverageError as exc:
+        print(f"    捕获 CoverageError：{exc}")
+    else:
+        raise AssertionError("or 备选绑定不一致必须被拒绝")
+
+    # 执行边界：错误类型输入（int 冒充 Bool），可定位、不产生部分绑定
+    print()
+    print("  执行边界：错误类型输入（value 内层给了 int 而非 bool）被拒绝")
+    try:
+        cp.run(("Not", ("Lit", 1)))
+    except CoverageError as exc:
+        print(f"    捕获 CoverageError：{exc}")
+    else:
+        raise AssertionError("错误类型输入必须被拒绝")
 
     # ------------------------------------------------------- 巨大 Bool 积
     section("巨大 Bool 积：500 个 Bool 字段（值域 2^500，绝不展开笛卡尔积）")

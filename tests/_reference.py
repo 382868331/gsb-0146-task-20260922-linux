@@ -109,7 +109,13 @@ def _cartesian(lists):
             yield (head, *tail)
 
 
-def _match(types, tname, pat, value) -> bool:
+def _match(types, tname, pat, value, env=None) -> bool:
+    """覆盖/匹配语义下的匹配。env 给定时按执行语义收集绑定：
+
+    - ('var', 名字)：恒匹配（覆盖分析中的通配），env[名字] = 该位置完整子树；
+    - ('as', 子模式, 名字)：子模式匹配时 env[名字] = 该位置完整子树；
+    - or：各备选使用独立的子环境，成功备选的绑定合并回 env。
+    """
     if pat == "_":
         return True
     t = types[tname]
@@ -121,7 +127,7 @@ def _match(types, tname, pat, value) -> bool:
             return False
         if len(pat) != len(value):
             return False
-        return all(_match(types, ft, p, v)
+        return all(_match(types, ft, p, v, env)
                    for (_, ft), p, v in zip(t["fields"], pat, value))
 
     if isinstance(pat, str):
@@ -133,7 +139,23 @@ def _match(types, tname, pat, value) -> bool:
     # tuple
     tag = pat[0]
     if tag == "or":
-        return any(_match(types, tname, alt, value) for alt in pat[1:])
+        for alt in pat[1:]:
+            sub = {} if env is not None else None
+            if _match(types, tname, alt, value, sub):
+                if env is not None:
+                    env.update(sub)
+                return True
+        return False
+    if tag == "var":
+        if env is not None:
+            env[pat[1]] = value
+        return True
+    if tag == "as":
+        if _match(types, tname, pat[1], value, env):
+            if env is not None:
+                env[pat[2]] = value
+            return True
+        return False
     # 构造器模式
     if kind != "sum" or not isinstance(value, tuple):
         return False
@@ -143,12 +165,24 @@ def _match(types, tname, pat, value) -> bool:
     args = pat[1:]
     if len(args) != len(fields):
         return False
-    return all(_match(types, ft, p, v)
+    return all(_match(types, ft, p, v, env)
                for (_, ft), p, v in zip(fields, args, value[1:]))
 
 
 def matches(ref: RefTypeTable, tname: str, pat, value) -> bool:
     return ref.matches(tname, pat, value)
+
+
+def ref_run(ref: RefTypeTable, root: str, patterns, value):
+    """独立执行参照：按源顺序直接递归匹配，返回 (分支下标, 绑定字典)；无命中 None。
+
+    与被测核心完全独立（不导入 patcov）；绑定槽逐分支新建，失败分支整体丢弃。
+    """
+    for i, pat in enumerate(patterns):
+        env: dict = {}
+        if _match(ref.types, root, pat, value, env):
+            return i, env
+    return None
 
 
 def brute_force_expected(ref: RefTypeTable, root: str, patterns) -> dict:

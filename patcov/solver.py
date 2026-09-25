@@ -213,7 +213,12 @@ class DecisionSolver:
         qtail = self._q_tail[qid]
         ptag = p[0]
 
-        if ptag == "W":
+        # as 绑定不改变匹配集：其覆盖集就是内层模式的覆盖集（捕获发生在执行期）。
+        if ptag == "A":
+            return self.add(node, sig_id, self.q_cons(p[2], qtail))
+
+        if ptag in ("W", "B"):
+            # 通配与变量绑定都匹配该位置的任意值；绑定在覆盖分析中按通配处理。
             new_children = []
             for j, ctor in enumerate(ctors):
                 csig = self.child_sig(ctor, rest_sig)
@@ -273,6 +278,10 @@ class DecisionSolver:
         qtail = self._q_tail[qid]
         ptag = p[0]
 
+        # as 不改变匹配集：见证与内层模式完全一致。
+        if ptag == "A":
+            return self.useful(node, sig_id, self.q_cons(p[2], qtail))
+
         def try_ctor(j: int, args: tuple):
             ctor = ctors[j]
             csig = self.child_sig(ctor, rest_sig)
@@ -280,8 +289,8 @@ class DecisionSolver:
             old_ch = BOT_ID if is_bot else old_children[j]
             return self.useful(old_ch, csig, cq)
 
-        if ptag in ("W", "T", "C"):
-            if ptag == "W":
+        if ptag in ("W", "B", "T", "C"):
+            if ptag in ("W", "B"):
                 order = range(len(ctors))
             elif ptag == "T":
                 order = (0,)
@@ -290,7 +299,7 @@ class DecisionSolver:
             for j in order:
                 ctor = ctors[j]
                 arity = len(ctor.fields)
-                if ptag == "W":
+                if ptag in ("W", "B"):
                     args = self._wild_args(arity)
                 elif ptag == "T":
                     args = p[1]
