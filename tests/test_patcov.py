@@ -226,6 +226,73 @@ class TestHugeBoolProduct(unittest.TestCase):
 
 # ----------------------------------------------------------------- 与独立暴力参考
 
+class TestExactCounts(unittest.TestCase):
+    """精确计数：各分支实际接收值数与整体遗漏数（手工核对 + 大数恒等式）。"""
+
+    def test_bool_root_counts(self):
+        r = analyze(BOOL_TYPES, ["True"])
+        self.assertEqual(r.total_values, 2)
+        self.assertEqual([b.count for b in r.branches], [1])
+        self.assertEqual(r.uncovered_count, 1)
+
+    def test_first_match_wins(self):
+        # 同一值符合多个模式时只计入最先命中的分支
+        r = analyze(BOOL_TYPES, ["_", "False", "True"])
+        self.assertEqual([b.count for b in r.branches], [2, 0, 0])
+        self.assertEqual(r.uncovered_count, 0)
+        self.assertEqual(r.total_values, 2)
+
+    def test_product_overlap_counts(self):
+        types = {"P": {"kind": "product", "fields": [("a", "Bool"), ("b", "Bool")]}}
+        # (True,_) 收 2 个；(_,True) 只剩 (False,True) 1 个；遗漏 (False,False) 1 个
+        r = analyze(types, [["True", "_"], ["_", "True"]])
+        self.assertEqual([b.count for b in r.branches], [2, 1])
+        self.assertEqual(r.uncovered_count, 1)
+        self.assertEqual(r.total_values, 4)
+        self.assertEqual(sum(b.count for b in r.branches) + r.uncovered_count,
+                         r.total_values)
+
+    def test_or_counts_union_once(self):
+        # or 语义为集合求并：重复备选不重复计数
+        r = analyze(BOOL_TYPES, [("or", "True", "True", "False")])
+        self.assertEqual([b.count for b in r.branches], [2])
+        self.assertEqual(r.uncovered_count, 0)
+
+    def test_sum_counts(self):
+        types = {
+            "Shape": {"kind": "sum", "variants": [
+                ("Circle", [("r", "Bool")]),      # 2 个值
+                ("Rect", [("w", "Bool"), ("h", "Bool")]),  # 4 个值
+                ("Dot", []),                       # 1 个值
+            ]},
+        }
+        r = analyze(types, [("Circle", "True"), ("Rect", "True", "_"),
+                            ("or", "Dot", ("Circle", "False")), "_"])
+        # 分支接收：1 + 2 + 2 + 剩余 2（(Rect,False,False)/(Rect,False,True)）
+        self.assertEqual([b.count for b in r.branches], [1, 2, 2, 2])
+        self.assertEqual(r.uncovered_count, 0)
+        self.assertEqual(r.total_values, 7)
+
+    def test_huge_bool_product_counts(self):
+        # 2^500 值域：精确大整数计数，不展开、不抽样
+        n = 500
+        types = {"Big": {"kind": "product",
+                         "fields": [(f"b{i}", "Bool") for i in range(n)]}}
+        r = analyze(types, [["False"] + ["_"] * (n - 1), ["True"] * n])
+        self.assertEqual(r.total_values, 1 << n)
+        self.assertEqual([b.count for b in r.branches], [1 << (n - 1), 1])
+        self.assertEqual(r.uncovered_count, (1 << (n - 1)) - 1)
+        self.assertEqual(sum(b.count for b in r.branches) + r.uncovered_count,
+                         r.total_values)
+
+    def test_empty_patterns_all_uncovered(self):
+        types = {"C": {"kind": "enum", "constructors": ["A", "B", "C"]}}
+        r = analyze(types, [])
+        self.assertEqual(r.branches, ())
+        self.assertEqual(r.uncovered_count, 3)
+        self.assertEqual(r.total_values, 3)
+
+
 class TestAgainstBruteForce(unittest.TestCase):
     """小类型上与独立枚举参考逐值核对，含随机 or 模式。"""
 
@@ -275,10 +342,19 @@ class TestAgainstBruteForce(unittest.TestCase):
         msg = f"\n类型={types}\n模式={pats}"
         self.assertEqual(got.uncovered, exp["uncovered"], msg)
         self.assertEqual(got.exhaustive, exp["uncovered"] is None, msg)
+        self.assertEqual(got.uncovered_count, exp["uncovered_count"], msg)
+        self.assertEqual(got.total_values, exp["total_values"], msg)
+        self.assertEqual(got.exhaustive, got.uncovered_count == 0, msg)
         self.assertEqual(len(got.branches), len(exp["branches"]), msg)
+        # 恒等式：各分支接收数 + 遗漏数 == 全部可能值
+        self.assertEqual(
+            sum(b.count for b in got.branches) + got.uncovered_count,
+            got.total_values, msg)
         for b, eb in zip(got.branches, exp["branches"]):
             self.assertEqual(b.useful, eb["useful"], msg + f"\n分支 {b.index}")
             self.assertEqual(b.witness, eb["witness"], msg + f"\n分支 {b.index}")
+            self.assertEqual(b.count, eb["count"], msg + f"\n分支 {b.index}")
+            self.assertEqual(b.useful, b.count > 0, msg + f"\n分支 {b.index}")
             if eb["useful"]:
                 # 补充往返：见证未被前序分支匹配、且被本分支匹配
                 self.assertFalse(

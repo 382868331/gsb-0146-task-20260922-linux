@@ -152,7 +152,12 @@ def matches(ref: RefTypeTable, tname: str, pat, value) -> bool:
 
 
 def brute_force_expected(ref: RefTypeTable, root: str, patterns) -> dict:
-    """逐分支暴力计算期望值。返回 {uncovered, branches:[{useful,witness}]}。"""
+    """逐分支暴力计算期望值。
+
+    返回 {uncovered, uncovered_count, total_values,
+          branches:[{useful, witness, count}]}；
+    count 为“匹配本分支但不匹配任何前序分支”的值个数（逐值统计）。
+    """
     universe = set(ref.all_values(root))
     covered: set = set()
     branches = []
@@ -161,10 +166,11 @@ def brute_force_expected(ref: RefTypeTable, root: str, patterns) -> dict:
         fresh = matched - covered
         if fresh:
             witness = min(fresh, key=lambda v: ref.key(root, v))
-            branches.append({"useful": True, "witness": witness})
+            branches.append({"useful": True, "witness": witness, "count": len(fresh)})
         else:
-            branches.append({"useful": False, "witness": None})
+            branches.append({"useful": False, "witness": None, "count": 0})
         covered |= matched
     leftover = universe - covered
     uncovered = min(leftover, key=lambda v: ref.key(root, v)) if leftover else None
-    return {"uncovered": uncovered, "branches": branches}
+    return {"uncovered": uncovered, "uncovered_count": len(leftover),
+            "total_values": len(universe), "branches": branches}

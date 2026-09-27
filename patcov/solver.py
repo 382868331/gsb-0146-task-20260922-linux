@@ -70,6 +70,11 @@ class DecisionSolver:
         # (字段类型 tuple, q 尾) -> 全通配序列
         self._wild_q_cache: dict[tuple, int] = {}
 
+        # 精确计数：类型大小与“节点覆盖值数”记忆化（任意精度整数，不抽样）
+        self._tsize: dict[int, int] = {}
+        self._sig_size: dict[int, int] = {}
+        self._count_memo: dict[tuple, int] = {}
+
     # --------------------------------------------------------------- 基础设施
     def _tick(self):
         self.used += 1
@@ -345,3 +350,67 @@ class DecisionSolver:
             s = self._sig_tail[s]
         qid = self.wilds(tuple(types), EMPTY)
         return self.useful(node, sig_id, qid)
+
+    # --------------------------------------------------------------- 精确计数
+    def type_size(self, tid: int) -> int:
+        """该类型的全部可能值个数（任意精度整数）。"""
+        size = self._tsize.get(tid)
+        if size is not None:
+            return size
+        decl = self.by_id[tid]
+        if decl.kind == "bool":
+            size = 2
+        elif decl.kind == "enum":
+            size = len(decl.ctors)
+        elif decl.kind == "product":
+            size = 1
+            for _, ft in decl.ctors[0].fields:
+                size *= self.type_size(ft)
+        else:  # sum
+            size = 0
+            for ctor in decl.ctors:
+                term = 1
+                for _, ft in ctor.fields:
+                    term *= self.type_size(ft)
+                size += term
+        self._tsize[tid] = size
+        return size
+
+    def sig_size(self, sig_id: int) -> int:
+        """位置序列上全部值组合的个数（各位置类型大小之积）。"""
+        if sig_id == EMPTY:
+            return 1
+        size = self._sig_size.get(sig_id)
+        if size is None:
+            size = self.type_size(self._sig_head[sig_id]) * self.sig_size(self._sig_tail[sig_id])
+            self._sig_size[sig_id] = size
+        return size
+
+    def count(self, node: int, sig_id: int) -> int:
+        """node 在 sig_id 位置序列上覆盖的值个数（精确，非抽样）。
+
+        与 add/useful 同口径记忆化并计入预算；宽积沿共享子节点求和，
+        规模与决策 DAG 成正比，不展开值域笛卡尔积。
+        """
+        if sig_id == EMPTY:
+            return 1 if node == TOP_ID else 0
+        if node == BOT_ID:
+            return 0
+        if node == TOP_ID:
+            return self.sig_size(sig_id)
+        key = (node, sig_id)
+        cached = self._count_memo.get(key)
+        if cached is not None:
+            return cached
+        self._tick()
+        tid = self._sig_head[sig_id]
+        rest_sig = self._sig_tail[sig_id]
+        decl = self.by_id[tid]
+        children = self._node_children[node]
+        total = 0
+        for j, ctor in enumerate(decl.ctors):
+            ch = children[j]
+            if ch != BOT_ID:
+                total += self.count(ch, self.child_sig(ctor, rest_sig))
+        self._count_memo[key] = total
+        return total

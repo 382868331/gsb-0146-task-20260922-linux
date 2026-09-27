@@ -39,11 +39,15 @@ class BranchResult:
     :ivar useful: 该分支是否存在未被前面分支覆盖的值
     :ivar witness: 有用时为字典序最小的见证值；冗余（不可达）时为 None
     :ivar redundant: 等价于 ``not useful``，冗余分支即永不匹配的分支
+    :ivar count: 实际由该分支接收的值个数（精确整数）：匹配本分支、但不匹配
+        任何前序分支的值的数量。同一值即使符合多个模式也只计入最先命中的
+        分支，故各分支 count 互不重迭；``useful`` 等价于 ``count > 0``。
     """
 
     index: int
     useful: bool
     witness: object
+    count: int
 
     @property
     def redundant(self) -> bool:
@@ -57,13 +61,21 @@ class AnalysisResult:
     :ivar branches: 各分支判定（源顺序）
     :ivar uncovered: 整体遗漏值中字典序最小的一个；穷举时为 None
     :ivar exhaustive: 是否穷举（无遗漏）
+    :ivar uncovered_count: 未被任何分支处理的值个数（精确整数）；
+        ``exhaustive`` 等价于 ``uncovered_count == 0``
+    :ivar total_values: 根类型的全部可能值个数（精确整数）
     :ivar budget_used: 实际消耗的搜索工作量单位
     :ivar budget: 本次预算
+
+    恒等式（可相互核对）：
+    ``sum(b.count for b in branches) + uncovered_count == total_values``
     """
 
     branches: tuple
     uncovered: object
     exhaustive: bool
+    uncovered_count: int
+    total_values: int
     budget_used: int
     budget: int
 
@@ -118,20 +130,27 @@ def analyze(types, patterns, *, budget: int = DEFAULT_BUDGET) -> AnalysisResult:
     for i, pat in enumerate(norm):
         witness_vid = solver.useful(cov, root_sig, solver.root_q(pat))
         useful = witness_vid is not None
-        branches.append(
-            BranchResult(index=i, useful=useful,
-                         witness=solver.root_value(witness_vid) if useful else None)
-        )
+        before = solver.count(cov, root_sig)
         # 冗余分支的加入是空操作（其值集已被覆盖）；统一加入不改变结果。
         cov = solver.add(cov, root_sig, solver.root_q(pat))
+        after = solver.count(cov, root_sig)
+        branches.append(
+            BranchResult(index=i, useful=useful,
+                         witness=solver.root_value(witness_vid) if useful else None,
+                         count=after - before)
+        )
 
     uncovered_vid = solver.smallest_uncovered(cov, root_sig)
     uncovered = solver.root_value(uncovered_vid) if uncovered_vid is not None else None
+    total_values = solver.sig_size(root_sig)
+    uncovered_count = total_values - solver.count(cov, root_sig)
 
     return AnalysisResult(
         branches=tuple(branches),
         uncovered=uncovered,
         exhaustive=(uncovered is None),
+        uncovered_count=uncovered_count,
+        total_values=total_values,
         budget_used=solver.used,
         budget=budget,
     )
