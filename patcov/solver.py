@@ -59,6 +59,8 @@ class DecisionSolver:
         # 记忆化（键均为整数）
         self._add_memo: dict[tuple, int] = {}
         self._use_memo: dict[tuple, object] = {}
+        self._free_memo: dict[tuple, int] = {}
+        self._match_memo: dict[tuple, int] = {}
         self._NONE = object()
 
         # 见证持久 cons 链表：head 值 + tail id；空为 EMPTY(-1)。
@@ -69,6 +71,10 @@ class DecisionSolver:
 
         # (字段类型 tuple, q 尾) -> 全通配序列
         self._wild_q_cache: dict[tuple, int] = {}
+
+        # 基数（精确计数，Python 大整数；永不逐值展开）
+        self._type_card: dict[int, int] = {}
+        self._sig_card: dict[int, int] = {EMPTY: 1}  # EMPTY 序列只含单位元 ()
 
     # --------------------------------------------------------------- 基础设施
     def _tick(self):
@@ -187,6 +193,119 @@ class DecisionSolver:
             out.append(self._v_head[vid])
             vid = self._v_tail[vid]
         return tuple(out), vid
+
+    # --------------------------------------------------------------- 精确计数
+    def cardinality_type(self, tid: int) -> int:
+        """单个类型的值总数：各构造器（字段值数之积）之和。"""
+        n = self._type_card.get(tid)
+        if n is not None:
+            return n
+        decl = self.by_id[tid]
+        total = 0
+        for ctor in decl.ctors:
+            per = 1
+            for _, ft in ctor.fields:
+                per *= self.cardinality_type(ft)
+            total += per
+        self._type_card[tid] = total
+        return total
+
+    def cardinality_sig(self, sig_id: int) -> int:
+        """类型序列的值元组总数：各位置类型基数之积。"""
+        n = self._sig_card.get(sig_id)
+        if n is not None:
+            return n
+        n = self.cardinality_type(self._sig_head[sig_id])
+        n *= self.cardinality_sig(self._sig_tail[sig_id])
+        self._sig_card[sig_id] = n
+        return n
+
+    def count_free(self, node: int, sig_id: int) -> int:
+        """sig 序列中*未被 node 覆盖*的值元组数（精确，不展开值域）。
+
+        分支节点按构造器分解：未覆盖数 = 各构造器子节点未覆盖数之和；
+        构造器字段与兄弟位置在同一子序列上做积，全部为大整数符号运算。
+        """
+        if node == TOP_ID:
+            return 0
+        if sig_id == EMPTY:
+            return 1 if node == BOT_ID else 0
+        if node == BOT_ID:
+            return self.cardinality_sig(sig_id)
+        key = (node, sig_id)
+        cached = self._free_memo.get(key)
+        if cached is not None:
+            return cached
+        self._tick()
+        tid = self._sig_head[sig_id]
+        rest_sig = self._sig_tail[sig_id]
+        ctors = self.by_id[tid].ctors
+        total = 0
+        for j, child in enumerate(self._node_children[node]):
+            csig = self.child_sig(ctors[j], rest_sig)
+            total += self.count_free(child, csig)
+        self._free_memo[key] = total
+        return total
+
+    def count_match(self, node: int, sig_id: int, qid: int) -> int:
+        """sig 序列中*被 qid 匹配且未被 node 覆盖*的值元组数（精确）。
+
+        与 useful 同构但做计数：构造器分支求和、字段序列做积；or 不做
+        容斥展开，而是顺序把已处理备选并入 node，新增量天然互不重叠。
+        """
+        if qid == EMPTY:
+            return 1 if node == BOT_ID else 0
+        if node == TOP_ID:
+            return 0
+        if self._q_allwild[qid]:
+            return self.count_free(node, sig_id)
+        key = (node, sig_id, qid)
+        cached = self._match_memo.get(key)
+        if cached is not None:
+            return cached
+        self._tick()
+
+        tid = self._sig_head[sig_id]
+        rest_sig = self._sig_tail[sig_id]
+        decl = self.by_id[tid]
+        ctors = decl.ctors
+        is_bot = node == BOT_ID
+        old_children = () if is_bot else self._node_children[node]
+        p = self._pat_node[self._q_head[qid]]
+        qtail = self._q_tail[qid]
+        ptag = p[0]
+
+        if ptag == "W":
+            total = 0
+            for j, ctor in enumerate(ctors):
+                csig = self.child_sig(ctor, rest_sig)
+                cq = self.wilds(self._field_types(ctor), qtail)
+                old_ch = BOT_ID if is_bot else old_children[j]
+                # 通配矩形 = 全部构造器的字段全通配之并。
+                # 若展开后子序列为全通配，直接取该子节点的未覆盖数
+                #（count_free 对 BOT 立即返回基数，不会形成互递归环）。
+                if self._q_allwild[cq]:
+                    total += self.count_free(old_ch, csig)
+                else:
+                    total += self.count_match(old_ch, csig, cq)
+        elif ptag in ("C", "T"):
+            idx = 0 if ptag == "T" else p[1][1]
+            args = p[1] if ptag == "T" else p[2]
+            ctor = ctors[idx]
+            csig = self.child_sig(ctor, rest_sig)
+            cq = self.child_q(args, qtail)
+            old_ch = BOT_ID if is_bot else old_children[idx]
+            total = self.count_match(old_ch, csig, cq)
+        else:  # or：顺序并集，逐备选只计入“新增加”的量，杜绝重复计数
+            total = 0
+            unode = node
+            for alt in p[1]:
+                aq = self.q_cons(alt, qtail)
+                total += self.count_match(unode, sig_id, aq)
+                unode = self.add(unode, sig_id, aq)
+
+        self._match_memo[key] = total
+        return total
 
     # --------------------------------------------------------------- 加入覆盖
     def add(self, node: int, sig_id: int, qid: int) -> int:

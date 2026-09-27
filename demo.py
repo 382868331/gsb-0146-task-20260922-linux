@@ -59,14 +59,18 @@ def main() -> None:
     print("分支（源顺序 = 匹配优先级）：")
     for b in result.branches:
         if b.useful:
-            print(f"  分支 {b.index}: 有用，最小见证 = {render(b.witness)}")
+            print(f"  分支 {b.index}: 有用，首个命中 {b.count} 种输入，"
+                  f"最小见证 = {render(b.witness)}")
         else:
-            print(f"  分支 {b.index}: 冗余（永不匹配，无未覆盖值）")
+            print(f"  分支 {b.index}: 冗余（永不匹配，命中 0 种输入）")
     print(f"冗余分支下标：{list(result.redundant_branches)}")
+    print(f"全部可能值：{result.total_count}；各分支首命中之和：{result.covered_count}；"
+          f"未被任何分支处理：{result.uncovered_count}")
+    assert result.covered_count + result.uncovered_count == result.total_count
     if result.exhaustive:
-        print("整体：已穷举，无遗漏值。")
+        print("整体：已穷举，无遗漏值（遗漏数 = 0）。")
     else:
-        print(f"整体：字典序最小遗漏值 = {render(result.uncovered)}")
+        print(f"整体：遗漏 {result.uncovered_count} 种，字典序最小遗漏值 = {render(result.uncovered)}")
 
     # ------------------------------------------------------- 巨大 Bool 积
     section("巨大 Bool 积：500 个 Bool 字段（值域 2^500，绝不展开笛卡尔积）")
@@ -80,6 +84,10 @@ def main() -> None:
     dt = time.time() - t0
     head = render(big.uncovered[:4])
     print(f"  两个分支均有用；冗余分支：{list(big.redundant_branches)}")
+    half = 1 << (n - 1)
+    print(f"  精确计数（Python 大整数，非抽样估计）：分支0 命中 {big.branch_counts[0]}（=2^{n-1}：{big.branch_counts[0] == half}），")
+    print(f"    分支1 命中 {big.branch_counts[1]}；遗漏 {big.uncovered_count}；全集 {big.total_count}（=2^{n}）")
+    assert sum(big.branch_counts) + big.uncovered_count == big.total_count
     print(f"  字典序最小遗漏值前 4 位：{head.rstrip(')')}, ...)（共 {n} 位）")
     print(f"  实算耗时 {dt*1000:.1f} ms，工作量单位 {big.budget_used}（约 5×字段数，线性，非 2^{n}）")
 

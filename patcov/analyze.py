@@ -39,11 +39,13 @@ class BranchResult:
     :ivar useful: 该分支是否存在未被前面分支覆盖的值
     :ivar witness: 有用时为字典序最小的见证值；冗余（不可达）时为 None
     :ivar redundant: 等价于 ``not useful``，冗余分支即永不匹配的分支
+    :ivar count: 该分支实际首个命中的值数（精确，非抽样）；冗余分支为 0
     """
 
     index: int
     useful: bool
     witness: object
+    count: int
 
     @property
     def redundant(self) -> bool:
@@ -57,6 +59,9 @@ class AnalysisResult:
     :ivar branches: 各分支判定（源顺序）
     :ivar uncovered: 整体遗漏值中字典序最小的一个；穷举时为 None
     :ivar exhaustive: 是否穷举（无遗漏）
+    :ivar branch_counts: 各分支首个命中的值数（int，精确；与 branches 同源顺序）
+    :ivar uncovered_count: 未被任何分支处理的值数（int，精确；穷举时为 0）
+    :ivar total_count: 根类型全部可能值的数量（int，精确）
     :ivar budget_used: 实际消耗的搜索工作量单位
     :ivar budget: 本次预算
     """
@@ -64,6 +69,9 @@ class AnalysisResult:
     branches: tuple
     uncovered: object
     exhaustive: bool
+    branch_counts: tuple
+    uncovered_count: int
+    total_count: int
     budget_used: int
     budget: int
 
@@ -71,6 +79,11 @@ class AnalysisResult:
     def redundant_branches(self) -> tuple:
         """所有冗余分支的下标（源顺序）。"""
         return tuple(b.index for b in self.branches if b.redundant)
+
+    @property
+    def covered_count(self) -> int:
+        """至少被一个分支处理的值总数（各 branch_counts 之和，因首命中互斥）。"""
+        return sum(self.branch_counts)
 
 
 def _check_budget(budget) -> int:
@@ -112,26 +125,37 @@ def analyze(types, patterns, *, budget: int = DEFAULT_BUDGET) -> AnalysisResult:
     by_id = table_by_id(table)
     solver = DecisionSolver(table, by_id, budget)
     root_sig = solver.root_sig(table.root)
+    total_count = solver.cardinality_sig(root_sig)
 
     cov = BOT_ID
     branches = []
+    branch_counts = []
     for i, pat in enumerate(norm):
-        witness_vid = solver.useful(cov, root_sig, solver.root_q(pat))
-        useful = witness_vid is not None
+        root_q = solver.root_q(pat)
+        # 精确计数与有用性同构：fresh>0 当且仅当分支有用。先计数，有用才取见证。
+        fresh = solver.count_match(cov, root_sig, root_q)
+        useful = fresh > 0
+        witness_vid = solver.useful(cov, root_sig, root_q) if useful else None
         branches.append(
             BranchResult(index=i, useful=useful,
-                         witness=solver.root_value(witness_vid) if useful else None)
+                         witness=solver.root_value(witness_vid) if useful else None,
+                         count=fresh)
         )
+        branch_counts.append(fresh)
         # 冗余分支的加入是空操作（其值集已被覆盖）；统一加入不改变结果。
-        cov = solver.add(cov, root_sig, solver.root_q(pat))
+        cov = solver.add(cov, root_sig, root_q)
 
     uncovered_vid = solver.smallest_uncovered(cov, root_sig)
     uncovered = solver.root_value(uncovered_vid) if uncovered_vid is not None else None
+    uncovered_count = solver.count_free(cov, root_sig)
 
     return AnalysisResult(
         branches=tuple(branches),
         uncovered=uncovered,
         exhaustive=(uncovered is None),
+        branch_counts=tuple(branch_counts),
+        uncovered_count=uncovered_count,
+        total_count=total_count,
         budget_used=solver.used,
         budget=budget,
     )
